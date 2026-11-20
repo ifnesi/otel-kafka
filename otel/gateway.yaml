@@ -1,0 +1,40 @@
+# GATEWAY - persistent queue (fsync). Elastic generates the document _id, so a replayed batch creates a DUPLICATE.
+# Same batching in every component of this demo: 200 ms or 5000 events (items).
+# The Elasticsearch exporter has no exporterhelper retry; its own HTTP retry is set to 1000 attempts (backoff up to 1 minute),
+# comparable to the sink connector's max.retries=1000.
+extensions:
+  file_storage/queue:
+    directory: /queue
+    create_directory: true
+    fsync: true
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  elasticsearch/logs:
+    endpoints: [http://elasticsearch:9200]
+    logs_index: otel-logs
+    mapping: { mode: raw }
+    logs_dynamic_id:
+      enabled: true                # the document _id is taken from the record attribute elasticsearch.document_id (= event_id), as the Kafka sink does
+    retry:
+      enabled: true
+      max_retries: 1000            # HTTP-level retries, backoff up to 1 minute (the exporter default is 2)
+    sending_queue:
+      enabled: true
+      storage: file_storage/queue
+      queue_size: 100000
+      block_on_overflow: true
+      batch: { flush_timeout: 200ms, min_size: 5000, max_size: 10000, sizer: items }
+  elasticsearch/metrics:
+    endpoints: [http://elasticsearch:9200]
+    mapping: { mode: otel }
+service:
+  extensions: [file_storage/queue]
+  telemetry:
+    logs: { level: info }
+  pipelines:
+    logs:    { receivers: [otlp], exporters: [elasticsearch/logs] }
+    metrics: { receivers: [otlp], exporters: [elasticsearch/metrics] }

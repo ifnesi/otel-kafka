@@ -1,0 +1,9 @@
+data/*
+!data/ledger/
+data/ledger/*
+!data/ledger/.gitkeep
+.docker-config/
+results/*
+!results/.gitkeep
+.claude/
+__pycache__/

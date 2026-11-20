@@ -1,0 +1,37 @@
+{
+  "name": "es-sink-logs",
+  "config": {
+    "connector.class": "io.confluent.connect.elasticsearch.ElasticsearchSinkConnector",
+    "tasks.max": "3",
+    "topics": "kafka-logs",
+    "connection.url": "http://elasticsearch:9200",
+    "type.name": "_doc",
+
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+
+    "transforms": "keyFromEventId,extractKey",
+    "transforms.keyFromEventId.type": "org.apache.kafka.connect.transforms.ValueToKey",
+    "transforms.keyFromEventId.fields": "event_id",
+    "transforms.extractKey.type": "org.apache.kafka.connect.transforms.ExtractField$Key",
+    "transforms.extractKey.field": "event_id",
+
+    "key.ignore": "false",
+    "schema.ignore": "true",
+    "write.method": "INSERT",
+    "behavior.on.null.values": "ignore",
+    "behavior.on.malformed.documents": "fail",
+
+    "flush.synchronously": "true",
+    "batch.size": "5000",
+    "linger.ms": "200",
+    "max.in.flight.requests": "2",
+    "max.retries": "1000",
+    "retry.backoff.ms": "2000",
+    "connection.timeout.ms": "5000",
+    "read.timeout.ms": "30000",
+
+    "errors.tolerance": "none"
+  }
+}

@@ -1,0 +1,33 @@
+# AGENT (otel scenario), SYNCHRONOUS variant: mirrors the Kafka Agent.
+# No disk on the Agent. The source gets its 2xx only after the Gateway has answered, and the Gateway answers after writing to ITS disk queue.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+processors:
+  resource:
+    attributes:
+      - { key: collector.agent, value: "${env:AGENT_ID}", action: upsert }
+exporters:
+  otlp:
+    endpoint: dns:///gateway:4317
+    balancer_name: round_robin
+    tls: { insecure: true }
+    timeout: 120s                  # same as the Kafka Agent (default 5 s per attempt)
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 10s
+      max_elapsed_time: 0          # retry forever
+    sending_queue:
+      enabled: true
+      wait_for_result: true        # the incoming OTLP request waits for the Gateway's answer
+      block_on_overflow: true
+      batch: { flush_timeout: 200ms, min_size: 5000, max_size: 10000 }   # same batching in every component: 200 ms or 5000 events
+service:
+  telemetry:
+    logs: { level: info }
+  pipelines:
+    logs:    { receivers: [otlp], processors: [resource], exporters: [otlp] }
+    metrics: { receivers: [otlp], processors: [resource], exporters: [otlp] }

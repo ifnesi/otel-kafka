@@ -1,0 +1,39 @@
+# AGENT (otel scenario) - HARDENED: file_storage persistent queue (fsync) + unlimited retry.
+# Ack to the source = "durably queued locally". Survives an agent crash, at the cost of possible duplicates on replay.
+extensions:
+  file_storage/queue:
+    directory: /queue
+    create_directory: true
+    fsync: true
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+processors:
+  resource:
+    attributes:
+      - { key: collector.agent, value: "${env:AGENT_ID}", action: upsert }
+exporters:
+  otlp:
+    endpoint: dns:///gateway:4317
+    balancer_name: round_robin
+    tls: { insecure: true }
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 10s
+      max_elapsed_time: 0          # retry forever
+    sending_queue:
+      enabled: true
+      storage: file_storage/queue
+      queue_size: 100000
+      block_on_overflow: true
+      batch: { flush_timeout: 200ms, min_size: 5000, max_size: 10000 }   # same batching in every component: 200 ms or 5000 events
+service:
+  extensions: [file_storage/queue]
+  telemetry:
+    logs: { level: info }
+  pipelines:
+    logs:    { receivers: [otlp], processors: [resource], exporters: [otlp] }
+    metrics: { receivers: [otlp], processors: [resource], exporters: [otlp] }

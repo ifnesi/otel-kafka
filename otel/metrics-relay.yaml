@@ -1,0 +1,14 @@
+# Metrics are "shown, not scored": Kafka topic otel-metrics -> collector -> Elasticsearch (data streams, otel mapping)
+receivers:
+  kafka:
+    brokers: [broker-1:29092, broker-2:29092, broker-3:29092]
+    metrics: { topic: otel-metrics, encoding: otlp_json }
+    group_id: metrics-relay
+    initial_offset: earliest
+exporters:
+  elasticsearch:
+    endpoints: [http://elasticsearch:9200]
+    mapping: { mode: otel }
+service:
+  pipelines:
+    metrics: { receivers: [kafka], exporters: [elasticsearch] }

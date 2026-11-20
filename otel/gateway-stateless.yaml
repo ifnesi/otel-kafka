@@ -1,0 +1,33 @@
+# GATEWAY, STATELESS variant: nothing on disk. The Gateway answers the Agent only after Elasticsearch has answered the bulk request
+# (wait_for_result on an in-memory queue). If Elastic fails, the error is returned to the Agent (and from it to the source) instead of
+# being dropped, because with wait_for_result the queue returns the export's error to its caller.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  elasticsearch/logs:
+    endpoints: [http://elasticsearch:9200]
+    logs_index: otel-logs
+    mapping: { mode: raw }
+    logs_dynamic_id:
+      enabled: true                # the document _id is taken from the record attribute elasticsearch.document_id (= event_id), as the Kafka sink does
+    retry:
+      enabled: true
+      max_retries: 1000            # same as the persistent Gateway
+    sending_queue:
+      enabled: true
+      wait_for_result: true        # the incoming request waits for Elastic's answer; no persistent queue (the two cannot be combined)
+      block_on_overflow: true
+      queue_size: 10000
+      batch: { flush_timeout: 200ms, min_size: 5000, max_size: 10000, sizer: items }
+  elasticsearch/metrics:
+    endpoints: [http://elasticsearch:9200]
+    mapping: { mode: otel }
+service:
+  telemetry:
+    logs: { level: info }
+  pipelines:
+    logs:    { receivers: [otlp], exporters: [elasticsearch/logs] }
+    metrics: { receivers: [otlp], exporters: [elasticsearch/metrics] }

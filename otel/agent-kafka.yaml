@@ -1,0 +1,38 @@
+# AGENT (kafka scenario) - HARDENED: acks=all (with min.insync.replicas=2 / RF=3 on the topic),
+# the OTLP receiver only answers 2xx AFTER Kafka acknowledged (wait_for_result), block on overflow, retry forever.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+processors:
+  resource:
+    attributes:
+      - { key: collector.agent, value: "${env:AGENT_ID}", action: upsert }
+exporters:
+  kafka:
+    brokers: [broker-1:29092, broker-2:29092, broker-3:29092]
+    logs:    { topic: kafka-logs,    encoding: raw }
+    metrics: { topic: otel-metrics,  encoding: otlp_json }
+    producer:
+      required_acks: -1            # all in-sync replicas
+      compression: lz4             # batches are compressed on the wire and in the log (OTLP/gRPC on the OTel path gzips by default)
+      flush_max_messages: 1000
+    timeout: 120s                  # default 5s cancels in-flight produce requests during a broker failover
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 10s
+      max_elapsed_time: 0          # retry forever
+    sending_queue:
+      enabled: true
+      wait_for_result: true
+      block_on_overflow: true
+      # Collector equivalent of the producer's linger.ms / batch.size (the producer in this Collector version has no linger setting).
+      batch: { flush_timeout: 200ms, min_size: 5000, max_size: 10000 }   # same batching in every component: 200 ms or 5000 events
+service:
+  telemetry:
+    logs: { level: info }
+  pipelines:
+    logs:    { receivers: [otlp], processors: [resource], exporters: [kafka] }
+    metrics: { receivers: [otlp], processors: [resource], exporters: [kafka] }

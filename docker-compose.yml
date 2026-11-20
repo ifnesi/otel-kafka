@@ -1,0 +1,297 @@
+# OTel end-to-end  vs  Kafka-in-the-middle  -- resiliency demo
+#
+#   Scenario "otel" : generator -> agent-otel-N -> gateway(xN) -> Elasticsearch   (index: otel-logs)
+#   Scenario "kafka": generator -> agent-kafka-N -> Kafka (3 brokers) -> ES sink connector -> Elasticsearch (index: kafka-logs)
+#
+# Profiles: otel | kafka | load.  Driven by ./demo.sh (see README). All collector configs are the hardened ones;
+
+name: otel-kafka
+
+x-otel-image: &otel-image otel/opentelemetry-collector-contrib:${OTEL_VERSION:-0.139.0}
+
+x-broker-env: &broker-env
+  KAFKA_PROCESS_ROLES: 'broker,controller'
+  KAFKA_CONTROLLER_QUORUM_VOTERS: '1@broker-1:29093,2@broker-2:29093,3@broker-3:29093'
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT'
+  KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093'
+  KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+  KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+  KAFKA_LOG_DIRS: '/var/lib/kafka/data'
+  CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+  # --- durability / HA settings (this is the point of the demo) ---
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: 'false'
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_OFFSETS_TOPIC_MIN_ISR: 2
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  # Failure detection: the controller declares a silent broker dead after this long (defaults: 9000 / 2000). Writes to partitions led by
+  # a killed broker wait for this, so a shorter session shortens the failover stall.
+  KAFKA_BROKER_SESSION_TIMEOUT_MS: 3000
+  KAFKA_BROKER_HEARTBEAT_INTERVAL_MS: 1000
+  KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_CONFLUENT_BALANCER_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_CONFLUENT_METRICS_REPORTER_TOPIC_REPLICAS: 3
+  CONFLUENT_METRICS_ENABLE: 'false'
+  CONFLUENT_SUPPORT_CUSTOMER_ID: 'anonymous'
+  KAFKA_HEAP_OPTS: '-Xms512m -Xmx768m'
+
+x-broker: &broker
+  image: confluentinc/cp-server:${CP_VERSION:-8.2.0}
+  profiles: ["kafka"]
+  healthcheck:
+    test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+    interval: 10s
+    timeout: 10s
+    retries: 30
+    start_period: 20s
+
+x-agent: &agent
+  image: *otel-image
+  user: "0:0"                      # simplest way to get a writable queue volume
+  command: ["--config=/etc/otelcol/config.yaml"]
+  restart: "no"
+
+services:
+
+  # ---------------------------------------------------------------- Elastic (both scenarios)
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION:-8.18.0}
+    container_name: elasticsearch
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.ml.enabled: "false"
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ports: ["9200:9200"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s'"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+
+  es-init:
+    image: curlimages/curl:8.11.1
+    container_name: es-init
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+    volumes: ["./elastic:/elastic:ro"]
+    entrypoint: ["/bin/sh", "/elastic/init.sh"]
+    restart: "no"
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${ELASTIC_VERSION:-8.18.0}
+    container_name: kibana
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      NODE_OPTIONS: "--max-old-space-size=768"
+    ports: ["5601:5601"]
+
+  # ---------------------------------------------------------------- Scenario 1: OTel end to end
+  gateway:                          # no container_name: can be scaled (GATEWAY_REPLICAS=2)
+    image: *otel-image
+    profiles: ["otel"]
+    user: "0:0"
+    command: ["--config=/etc/otelcol/config.yaml"]
+    depends_on: [es-init]
+    volumes:
+      - ./otel/${GATEWAY_CFG:-gateway.yaml}:/etc/otelcol/config.yaml:ro
+      - gateway-queue:/queue
+    deploy:
+      replicas: ${GATEWAY_REPLICAS:-1}
+
+  agent-otel-1: &agent-otel
+    <<: *agent
+    profiles: ["otel"]
+    container_name: agent-otel-1
+    hostname: agent-otel-1
+    environment: { AGENT_ID: agent-1 }
+    depends_on: [gateway]
+    volumes:
+      - ./otel/${AGENT_OTEL_CFG:-agent-otel.yaml}:/etc/otelcol/config.yaml:ro
+      - agent-otel-1-queue:/queue
+  agent-otel-2:
+    <<: *agent-otel
+    container_name: agent-otel-2
+    hostname: agent-otel-2
+    environment: { AGENT_ID: agent-2 }
+    volumes:
+      - ./otel/${AGENT_OTEL_CFG:-agent-otel.yaml}:/etc/otelcol/config.yaml:ro
+      - agent-otel-2-queue:/queue
+  agent-otel-3:
+    <<: *agent-otel
+    container_name: agent-otel-3
+    hostname: agent-otel-3
+    environment: { AGENT_ID: agent-3 }
+    volumes:
+      - ./otel/${AGENT_OTEL_CFG:-agent-otel.yaml}:/etc/otelcol/config.yaml:ro
+      - agent-otel-3-queue:/queue
+
+  # ---------------------------------------------------------------- Scenario 2: Kafka instead of the gateway
+  broker-1:
+    <<: *broker
+    container_name: broker-1
+    hostname: broker-1
+    environment:
+      <<: *broker-env
+      KAFKA_NODE_ID: 1
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://broker-1:29092'
+    volumes: ["broker-1-data:/var/lib/kafka/data"]
+  broker-2:
+    <<: *broker
+    container_name: broker-2
+    hostname: broker-2
+    environment:
+      <<: *broker-env
+      KAFKA_NODE_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://broker-2:29092'
+    volumes: ["broker-2-data:/var/lib/kafka/data"]
+  broker-3:
+    <<: *broker
+    container_name: broker-3
+    hostname: broker-3
+    environment:
+      <<: *broker-env
+      KAFKA_NODE_ID: 3
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://broker-3:29092'
+    volumes: ["broker-3-data:/var/lib/kafka/data"]
+
+  topic-init:
+    image: confluentinc/cp-server:${CP_VERSION:-8.2.0}
+    profiles: ["kafka"]
+    container_name: topic-init
+    depends_on:
+      broker-1: { condition: service_healthy }
+      broker-2: { condition: service_healthy }
+      broker-3: { condition: service_healthy }
+    restart: "no"
+    command:
+      - bash
+      - -c
+      - |
+        B=broker-1:29092,broker-2:29092,broker-3:29092
+        kafka-topics --bootstrap-server $$B --create --if-not-exists --topic kafka-logs \
+          --partitions 6 --replication-factor 3 \
+          --config min.insync.replicas=2 --config unclean.leader.election.enable=false --config retention.ms=604800000
+        kafka-topics --bootstrap-server $$B --create --if-not-exists --topic otel-metrics \
+          --partitions 3 --replication-factor 3 --config min.insync.replicas=2
+        kafka-topics --bootstrap-server $$B --describe --topic kafka-logs
+
+  connect:
+    build:
+      context: ./connect
+      args:
+        CP_VERSION: ${CP_VERSION:-8.2.0}
+        ES_CONNECTOR_VERSION: ${ES_CONNECTOR_VERSION:-latest}
+    image: otel-kafka-connect:local
+    profiles: ["kafka"]
+    container_name: connect
+    hostname: connect
+    depends_on:
+      topic-init: { condition: service_completed_successfully }
+      es-init: { condition: service_completed_successfully }
+    ports: ["8083:8083"]
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: 'broker-1:29092,broker-2:29092,broker-3:29092'
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect
+      CONNECT_GROUP_ID: otel-connect-group
+      CONNECT_CONFIG_STORAGE_TOPIC: connect-configs
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 3
+      CONNECT_OFFSET_STORAGE_TOPIC: connect-offsets
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 3
+      CONNECT_STATUS_STORAGE_TOPIC: connect-status
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 3
+      CONNECT_OFFSET_FLUSH_INTERVAL_MS: 5000
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components"
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx1g"
+
+  # Metrics are shown (not scored): Kafka topic otel-metrics -> collector -> Elasticsearch
+  metrics-relay:
+    image: *otel-image
+    profiles: ["kafka"]
+    container_name: metrics-relay
+    user: "0:0"
+    command: ["--config=/etc/otelcol/config.yaml"]
+    depends_on:
+      topic-init: { condition: service_completed_successfully }
+      es-init: { condition: service_completed_successfully }
+    volumes: ["./otel/metrics-relay.yaml:/etc/otelcol/config.yaml:ro"]
+
+  agent-kafka-1: &agent-kafka
+    <<: *agent
+    profiles: ["kafka"]
+    container_name: agent-kafka-1
+    hostname: agent-kafka-1
+    environment: { AGENT_ID: agent-1 }
+    depends_on:
+      topic-init: { condition: service_completed_successfully }
+    volumes:
+      - ./otel/agent-kafka.yaml:/etc/otelcol/config.yaml:ro
+      - agent-kafka-1-queue:/queue
+  agent-kafka-2:
+    <<: *agent-kafka
+    container_name: agent-kafka-2
+    hostname: agent-kafka-2
+    environment: { AGENT_ID: agent-2 }
+    volumes:
+      - ./otel/agent-kafka.yaml:/etc/otelcol/config.yaml:ro
+      - agent-kafka-2-queue:/queue
+  agent-kafka-3:
+    <<: *agent-kafka
+    container_name: agent-kafka-3
+    hostname: agent-kafka-3
+    environment: { AGENT_ID: agent-3 }
+    volumes:
+      - ./otel/agent-kafka.yaml:/etc/otelcol/config.yaml:ro
+      - agent-kafka-3-queue:/queue
+
+  # ---------------------------------------------------------------- Data sources (one-to-one with the agents)
+  generator-1: &generator
+    build: ./generator
+    image: otel-kafka-generator:local
+    profiles: ["load"]
+    container_name: generator-1
+    restart: "no"
+    volumes: ["./data/ledger:/ledger"]
+    environment: &generator-env
+      SCENARIO: ${SCENARIO:-otel}
+      RATE: ${RATE:-15000}                  # total events/s across all three sources
+      DURATION: ${DURATION:-120}            # seconds of generation
+      CLIENT_RETRY: ${CLIENT_RETRY:-on}     # on | off  (does the data source retry non-acked requests?)
+      CLIENT_RETRY_SECONDS: ${CLIENT_RETRY_SECONDS:-900}
+      DRAIN_SECONDS: ${DRAIN_SECONDS:-600}
+      BATCH: ${BATCH:-500}
+      SENDERS: ${SENDERS:-8}                # concurrent OTLP senders per data source
+      SEED: ${SEED:-42}
+      SOURCE_INDEX: "1"                     # one process (and CPU core) per data source
+  generator-2:
+    <<: *generator
+    container_name: generator-2
+    environment:
+      <<: *generator-env
+      SOURCE_INDEX: "2"
+  generator-3:
+    <<: *generator
+    container_name: generator-3
+    environment:
+      <<: *generator-env
+      SOURCE_INDEX: "3"
+
+volumes:
+  gateway-queue:
+  agent-otel-1-queue:
+  agent-otel-2-queue:
+  agent-otel-3-queue:
+  agent-kafka-1-queue:
+  agent-kafka-2-queue:
+  agent-kafka-3-queue:
+  broker-1-data:
+  broker-2-data:
+  broker-3-data:
