@@ -1,4 +1,4 @@
-# GATEWAY - persistent queue (fsync). Elastic generates the document _id, so a replayed batch creates a DUPLICATE.
+# GATEWAY - persistent queue (fsync). The document _id is the event ID (logs_dynamic_id), so a replayed batch cannot create a second document.
 # Same batching in every component of this demo: 200 ms or 5000 events (items).
 # The Elasticsearch exporter has no exporterhelper retry; its own HTTP retry is set to 1000 attempts (backoff up to 1 minute),
 # comparable to the sink connector's max.retries=1000.

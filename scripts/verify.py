@@ -30,6 +30,18 @@ def es_count(es, index):
         return None
 
 
+def es_write_stats(es, index):
+    """Elastic's own count of the writes it received for this index (a ground truth independent of the clients):
+    index_total = writes applied (new documents and overwrites), index_failed = writes refused (for example version conflicts).
+    The counters restart from zero when Elasticsearch restarts, so the node uptime is returned too."""
+    try:
+        st = http("GET", f"{es}/{index}/_stats/indexing")["_all"]["primaries"]["indexing"]
+        up = max(n["jvm"]["uptime_in_millis"] for n in http("GET", f"{es}/_nodes/stats/jvm")["nodes"].values()) / 1000
+        return st["index_total"], st["index_failed"], st.get("index_failed_due_to_version_conflict", 0), up
+    except Exception:
+        return None, None, None, None
+
+
 def extract_event_id(src):
     """event_id location depends on the path: kafka sink => top level (JSON body), otel raw mapping => attributes/body."""
     for k in ("event_id", "Attributes.event_id", "attributes.event_id"):
@@ -83,11 +95,11 @@ def sh(cmd, timeout=120):
         return ""
 
 
-def kafka_lag():
+def kafka_lag(group="connect-es-sink-logs"):
     """Sum of lag of the sink connector's consumer group, or None if Kafka can't be queried."""
     for b in ("broker-1", "broker-2", "broker-3"):
         out = sh(["docker", "exec", b, "kafka-consumer-groups", "--bootstrap-server", f"{b}:29092",
-                  "--describe", "--group", "connect-es-sink-logs"], 30)
+                  "--describe", "--group", group], 30)
         lag, seen = 0, False
         for line in out.splitlines():
             p = line.split()
@@ -117,19 +129,6 @@ def kafka_topic_stats():
     return None, None, set()
 
 
-def gateway_conflicts():
-    """Deliveries Elastic rejected as version conflicts (a second write of an existing _id); the Gateway logs each one."""
-    ids = sh(["docker", "ps", "-aq", "--filter", "name=gateway"]).split()
-    total = 0
-    for c in ids:
-        try:
-            out = subprocess.run(["docker", "logs", c], capture_output=True, text=True, timeout=120)
-            total += (out.stdout + out.stderr).count("version_conflict_engine_exception")
-        except Exception:
-            pass
-    return total
-
-
 def pct(vals, p):
     if not vals:
         return None
@@ -146,8 +145,10 @@ def main():
     ap.add_argument("--ledger", default=os.path.join(ROOT, "data", "ledger"))
     ap.add_argument("--wait", type=int, default=0, help="max seconds to wait for the pipeline to quiesce")
     ap.add_argument("--stable", type=int, default=30, help="seconds the ES count must stay unchanged")
+    ap.add_argument("--index", default=None, help="Elasticsearch index to check (default <scenario>-logs)")
+    ap.add_argument("--group", default="connect-es-sink-logs", help="consumer group of the sink connector (Kafka path)")
     a = ap.parse_args()
-    index = f"{a.scenario}-logs"
+    index = a.index or f"{a.scenario}-logs"
     label = a.label or f"{a.variant}__adhoc"
 
     # ---- ledger
@@ -171,8 +172,8 @@ def main():
         deadline, last, since = time.time() + a.wait, -1, time.time()
         print(f"waiting for pipeline to quiesce (stable {a.stable}s, max {a.wait}s)...", flush=True)
         while time.time() < deadline:
-            c = es_count(a.es, index)
-            lag = kafka_lag() if a.scenario == "kafka" else 0
+            c = es_count(a.es, index) or 0     # None (index not created yet) counts as 0
+            lag = kafka_lag(a.group) if a.scenario == "kafka" else 0
             # unknown sink lag (None) or lag > 0 means the sink is still working
             if c != last or lag != 0:
                 last, since = c, time.time()
@@ -190,6 +191,12 @@ def main():
 
     # ---- Elasticsearch
     docs = es_scan(a.es, index)
+    w_total, w_failed, w_conflict, w_uptime = es_write_stats(a.es, index)
+    first_gen = min(x[1] for x in ledger.values()) / 1000
+    # the counters are only meaningful if Elasticsearch has not restarted since the load started (a restart resets them)
+    w_valid = w_total is not None and w_uptime is not None and w_uptime >= (time.time() - first_gen) - 30
+    w_received = (w_total + w_failed) if w_valid else None
+    w_extra = (w_received - len(docs)) if w_valid else None
     seen, ingested, unknown, no_id = {}, {}, 0, 0
     overwritten = 0
     for _id, s, ver in docs:
@@ -216,8 +223,6 @@ def main():
     ack_lat = [(x[4] - x[1]) / 1000 for x in ledger.values() if x[2] and x[4]]
 
     # ---- duplicate DELIVERIES to Elastic, counted even when a deterministic _id makes Elastic keep one copy
-    rejected = gateway_conflicts() if a.scenario == "otel" else 0
-    dup_deliveries = dup_docs + overwritten + rejected
 
     # ---- Kafka topic (where do duplicates / losses happen?)
     k_total = k_distinct = k_lost = None
@@ -229,7 +234,6 @@ def main():
 
     # Kafka path: every duplicate record in the topic is written to Elastic again by the sink (collapsed by _id)
     topic_dups = (k_total - k_distinct) if (a.scenario == "kafka" and k_total is not None) else 0
-    dup_deliveries = dup_docs + overwritten + rejected + topic_dups
 
     # ---- ATTRIBUTION: who is responsible for each event that never reached Elastic?
     #   source_gave_up : never acked (retry off / retry window expired)  -> the data SOURCE's responsibility
@@ -251,14 +255,21 @@ def main():
         if ack:
             lost_attempts["retried" if att > 1 else "first_try"] += 1
         samples.setdefault(k, []).append((src, e))
+    # DUPLICATE DELIVERIES = writes that reached Elastic beyond one per event, from Elastic's OWN counters (the same measurement on both
+    # paths, whatever sent the repeat: an Agent retry, a Gateway retry, the sink connector re-reading records). The counters restart
+    # from zero when Elasticsearch restarts, so for runs that restart it (the -es-kill scenarios) the figure is not available.
+    # (Counting error strings in the Gateway log was tried and is NOT used: one log line repeats earlier errors, so it overcounts.)
+    dup_deliveries = w_extra
+    dd_source = "elastic-counters" if w_valid else "not available (Elasticsearch restarted)"
     res = dict(label=label, variant=a.variant, scenario=a.scenario, generated=len(ledger), acked=len(acked_ids),
                delivered_distinct=len(delivered), es_docs=len(docs), acked_lost=len(acked_lost),
                acked_lost_pct=round(100 * len(acked_lost) / max(len(acked_ids), 1), 3), unacked=len(unacked),
                unacked_but_delivered=len(unacked_delivered), duplicates=dup_docs,
                duplicate_pct=round(100 * dup_docs / max(len(delivered), 1), 3),
                source_resends=source_resends, source_resent_events=source_resent_events, source_max_attempts=source_max_attempts,
-               duplicates_overwritten=overwritten, duplicates_rejected=rejected, duplicates_in_topic=topic_dups, duplicate_deliveries=dup_deliveries,
-               duplicate_deliveries_pct=round(100 * dup_deliveries / max(len(acked_ids), 1), 3), unknown_docs=unknown, docs_without_event_id=no_id,
+               es_writes_received=w_received, es_writes_refused=w_failed if w_valid else None, es_writes_refused_version_conflict=w_conflict if w_valid else None, es_extra_writes=w_extra, es_stats_valid=w_valid,
+               duplicates_overwritten=overwritten, duplicates_in_topic=topic_dups, connect_workers=int(os.environ.get('CONNECT_WORKERS', '1')), duplicate_deliveries=dup_deliveries, duplicate_deliveries_source=dd_source,
+               duplicate_deliveries_pct=(round(100 * dup_deliveries / max(len(acked_ids), 1), 3) if dup_deliveries is not None else None), unknown_docs=unknown, docs_without_event_id=no_id,
                kafka_topic_total=k_total, kafka_topic_distinct=k_distinct, acked_missing_in_kafka=k_lost,
                latency_p50_s=pct(lat, .5), latency_p95_s=pct(lat, .95), latency_p99_s=pct(lat, .99), latency_max_s=max(lat) if lat else None,
                ack_latency_p50_s=pct(ack_lat, .5), ack_latency_p95_s=pct(ack_lat, .95), ack_latency_p99_s=pct(ack_lat, .99), ack_latency_max_s=max(ack_lat) if ack_lat else None,
@@ -277,7 +288,11 @@ def main():
     print(f" ACKED BUT LOST (silent loss)      {res['acked_lost']:>9}   ({res['acked_lost_pct']}% of acked)")
     print(f" never acked (source knows)        {res['unacked']:>9}   (of which delivered anyway: {res['unacked_but_delivered']})")
     print(f" DUPLICATE documents in Elastic    {res['duplicates']:>9}   ({res['duplicate_pct']}%)")
-    print(f" duplicate DELIVERIES to Elastic   {res['duplicate_deliveries']:>9}   ({res['duplicate_deliveries_pct']}% of acked): stored twice {dup_docs}, overwritten {overwritten}, rejected as conflicts {rejected}, duplicated in the Kafka topic {topic_dups}")
+    print(f" duplicate DELIVERIES to Elastic   {f(res['duplicate_deliveries'])} ({res['duplicate_deliveries_pct']}% of acked; source: {dd_source}); documents stored twice {dup_docs}, duplicate records in the Kafka topic {topic_dups}")
+    if w_valid:
+        print(f" Elastic's own write counters: {w_received} writes received for {len(docs)} documents = {w_extra} extra writes ({w_failed} refused, {w_conflict} of them version conflicts)")
+    else:
+        print(" Elastic's own write counters: not valid for this run (Elasticsearch restarted after the load started)")
     print(f" sources resent {source_resent_events} events {source_resends} times in total (max {source_max_attempts} attempts for one event)")
     if a.scenario == "kafka":
         print(f" Kafka topic records / distinct    {f(k_total):>9} / {f(k_distinct)}   (acked missing in Kafka: {f(k_lost)})")

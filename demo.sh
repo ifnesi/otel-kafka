@@ -3,11 +3,12 @@
 #
 #   ./demo.sh up <otel|kafka>        start a fresh stack to explore (Kibana http://localhost:5601)
 #   ./demo.sh run <scenario> [--stress]   one experiment: reset -> load -> fault -> verify
-#   ./demo.sh matrix                 the twelve scenarios x REPS (default 3), then the results table
+#   ./demo.sh matrix                 the seventeen scenarios x REPS (default 3), then the results table
 #   ./demo.sh load <otel|kafka>      start the data sources against a stack started with 'up'
 #   ./demo.sh chaos <fault> [secs]   inject a fault into a running stack
 #   ./demo.sh verify <scenario>      compare the sources' ledger with Elastic (+ Kafka)
 #   ./demo.sh monitor <otel|kafka>   live view: generated / acked / in Elastic / sink lag
+#   ./demo.sh replay                 Kafka only: run otel-kafka, then replay the retained topic into a new index with a second connector
 #   ./demo.sh down                   remove everything (KEEP_COLIMA=1 keeps the VM)
 #
 # scenarios: otel-e2e | otel-e2e-kill | otel-e2e-sync | otel-e2e-sync-kill | otel-e2e-stateless | otel-e2e-stateless-kill | otel-kafka | otel-kafka-kill
@@ -17,8 +18,10 @@
 #   --stress  : "kill" scenarios only; takes Elastic down first so a backlog exists (disk-loss-es-down)
 # env: RATE (events/s in total, split over 3 sources, default 15000)  DURATION (s, 60)  CLIENT_RETRY (on|off, on)
 #      BATCH (events per OTLP request, 500)  REPS (3)  FAULT_AT (s into the load, 5)  KILLS (5)  KILL_GAP (s, 10)  ES_DOWN (s, 60)
+#   *-es-pause : ELASTIC is frozen (docker pause) for ES_DOWN seconds, then resumed (address keeps resolving; requests time out)
+#   otel-kafka-connect-kill : TWO Connect workers; worker 1 is killed (kill -9) while writing, worker 2 takes over its tasks, worker 1 restarts after CONNECT_DOWN (30) s
 #   *-es-kill : ELASTIC is killed (kill -9) and kept down for ES_DOWN seconds (default 60), then restarted (the fault is on the destination)
-# faults: disk-loss disk-loss-es-down agent-disk-loss gateway-kill broker-kill two-brokers agent-kill es-outage partition none
+# faults: disk-loss es-kill es-pause connect-kill disk-loss-es-down agent-disk-loss gateway-kill broker-kill two-brokers agent-kill es-outage partition none
 cd "$(dirname "$0")" || exit 1
 ROOT="$PWD"
 source scripts/docker-env.sh          # sets $DC, colima_start/colima_stop
@@ -33,6 +36,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 parse_scenario() {   # sets ARCH (otel|kafka), FAULT, NAME
   local s="$1" stress="$2"
   GATEWAY_CFG=gateway.yaml
+  CONNECT_WORKERS=1                  # reset: only the connect-kill scenario runs two Connect workers
   AGENT_OTEL_CFG=agent-otel.yaml     # reset: the sync scenarios override it below (no leaking between scenarios in a matrix)
   case "$s" in
     otel-e2e)         ARCH=otel;  FAULT=none ;;
@@ -47,10 +51,15 @@ parse_scenario() {   # sets ARCH (otel|kafka), FAULT, NAME
     otel-e2e-sync-es-kill)      ARCH=otel;  FAULT=es-kill; AGENT_OTEL_CFG=agent-otel-sync.yaml ;;
     otel-e2e-stateless-es-kill) ARCH=otel;  FAULT=es-kill; AGENT_OTEL_CFG=agent-otel-sync.yaml; GATEWAY_CFG=gateway-stateless.yaml ;;
     otel-kafka-es-kill)         ARCH=kafka; FAULT=es-kill ;;
-    *) die "unknown scenario '$s' (otel-e2e | otel-e2e-kill | otel-e2e-sync | otel-e2e-sync-kill | otel-e2e-stateless | otel-e2e-stateless-kill | otel-kafka | otel-kafka-kill | <otel-e2e|otel-e2e-sync|otel-e2e-stateless|otel-kafka>-es-kill)" ;;
+    otel-e2e-es-pause)           ARCH=otel;  FAULT=es-pause ;;
+    otel-e2e-sync-es-pause)      ARCH=otel;  FAULT=es-pause; AGENT_OTEL_CFG=agent-otel-sync.yaml ;;
+    otel-e2e-stateless-es-pause) ARCH=otel;  FAULT=es-pause; AGENT_OTEL_CFG=agent-otel-sync.yaml; GATEWAY_CFG=gateway-stateless.yaml ;;
+    otel-kafka-es-pause)         ARCH=kafka; FAULT=es-pause ;;
+    otel-kafka-connect-kill)     ARCH=kafka; FAULT=connect-kill; CONNECT_WORKERS=2 ;;
+    *) die "unknown scenario '$s' (otel-e2e | otel-e2e-kill | otel-e2e-sync | otel-e2e-sync-kill | otel-e2e-stateless | otel-e2e-stateless-kill | otel-kafka | otel-kafka-kill | <otel-e2e|otel-e2e-sync|otel-e2e-stateless|otel-kafka>-es-kill | <same four>-es-pause | otel-kafka-connect-kill)" ;;
   esac
   NAME="$s"
-  export AGENT_OTEL_CFG GATEWAY_CFG
+  export AGENT_OTEL_CFG GATEWAY_CFG CONNECT_WORKERS
   if [ -n "$stress" ]; then
     [ "$FAULT" = disk-loss ] || die "--stress only applies to the -kill scenarios"
     FAULT=disk-loss-es-down; NAME="$s-es-down"
@@ -83,7 +92,7 @@ cmd_up() {
   if [ "$ARCH" = otel ]; then
     $DC --profile otel up -d elasticsearch es-init $KIB gateway
   else
-    $DC --profile kafka up -d elasticsearch es-init $KIB broker-1 broker-2 broker-3 topic-init connect metrics-relay
+    $DC --profile kafka up -d elasticsearch es-init $KIB broker-1 broker-2 broker-3 topic-init connect metrics-relay $([ "${CONNECT_WORKERS:-1}" = 2 ] && echo connect-2)
   fi
   echo; echo "Waiting for services..."
   wait_for "Elasticsearch" "curl -sf http://localhost:9200/_cluster/health" 60 || return 1
@@ -186,6 +195,22 @@ cmd_chaos() {
       docker kill -s KILL elasticsearch > /dev/null; sleep "$down"; docker start elasticsearch > /dev/null
       until curl -sf "http://localhost:9200/_cluster/health" > /dev/null 2>&1; do sleep 1; done
       say "CHAOS: elasticsearch answering again; unavailable for $(( $(date +%s) - t0 )) s in total" ;;
+    es-pause)     # ELASTIC is frozen (docker pause) for ES_DOWN seconds, then resumed: the name still resolves and connections
+                  # are accepted by the kernel, but nothing answers, so clients see timeouts instead of a DNS error
+      local down="${ES_DOWN:-60}" t0; t0=$(date +%s)
+      say "CHAOS: pause elasticsearch for ${down}s (it keeps its address; requests hang)"
+      docker pause elasticsearch > /dev/null; sleep "$down"; docker unpause elasticsearch > /dev/null
+      until curl -sf "http://localhost:9200/_cluster/health" > /dev/null 2>&1; do sleep 1; done
+      say "CHAOS: elasticsearch answering again; unavailable for $(( $(date +%s) - t0 )) s in total" ;;
+    connect-kill) # the SINK CONNECTOR worker is killed (kill -9) while it is writing, and restarted after CONNECT_DOWN seconds:
+                  # records Elastic already accepted but whose offsets were not yet committed are delivered again
+      local cd="${CONNECT_DOWN:-30}"
+      say "CHAOS: kill -9 connect (worker 1 of 2); the other worker takes over its tasks; worker 1 restarts after ${cd}s"
+      docker kill -s KILL connect > /dev/null
+      until curl -sf http://localhost:8084/connectors/es-sink-logs/status 2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);sys.exit(0 if d['tasks'] and all(t['state']=='RUNNING' and t['worker_id'].startswith('connect-2') for t in d['tasks']) else 1)"; do sleep 1; done
+      say "CHAOS: all sink tasks are running on worker 2"
+      sleep "$cd"; docker start connect > /dev/null
+      say "CHAOS: worker 1 restarted" ;;
     es-outage)    local s="${arg:-120}"; say "CHAOS: stop elasticsearch ${s}s"; docker stop -t 1 elasticsearch > /dev/null; sleep "$s"; docker start elasticsearch > /dev/null ;;
     partition)    local s="${arg:-60}" net
                   net=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "agent-$ARCH-1")
@@ -213,11 +238,20 @@ cmd_run() {
   python3 scripts/verify.py --variant "$NAME" --scenario "$ARCH" --label "$label" --wait 600 --stable 10
 }
 
+cmd_replay() {   # Kafka keeps the log: a second connector (new consumer group) re-reads the whole topic into another index
+  cmd_run otel-kafka || return 1
+  local label="otel-kafka-replay__rate${RATE}__retry-${CLIENT_RETRY}__run$(date +%H%M%S)"
+  say "REPLAY: the first run is verified; now a new connector reads the topic kafka-logs from the beginning into the index kafka-logs-replay"
+  curl -s -X DELETE http://localhost:8083/connectors/es-sink-replay > /dev/null 2>&1
+  curl -sf -X POST -H 'Content-Type: application/json' --data @connectors/es-sink-replay.json http://localhost:8083/connectors > /dev/null || die "could not create the replay connector"
+  python3 scripts/verify.py --variant otel-kafka-replay --scenario kafka --index kafka-logs-replay --group connect-es-sink-replay --label "$label" --wait 600 --stable 10
+}
+
 cmd_matrix() {
   local rep s
   for rep in $(seq 1 "${REPS:-3}"); do
     echo "##### repetition $rep"
-    for s in otel-e2e otel-e2e-kill otel-e2e-sync otel-e2e-sync-kill otel-e2e-stateless otel-e2e-stateless-kill otel-kafka otel-kafka-kill otel-e2e-es-kill otel-e2e-sync-es-kill otel-e2e-stateless-es-kill otel-kafka-es-kill; do cmd_run "$s"; done
+    for s in otel-e2e otel-e2e-kill otel-e2e-sync otel-e2e-sync-kill otel-e2e-stateless otel-e2e-stateless-kill otel-kafka otel-kafka-kill otel-e2e-es-kill otel-e2e-sync-es-kill otel-e2e-stateless-es-kill otel-kafka-es-kill otel-e2e-es-pause otel-e2e-sync-es-pause otel-e2e-stateless-es-pause otel-kafka-es-pause otel-kafka-connect-kill; do cmd_run "$s"; done
   done
   python3 scripts/report.py
 }
@@ -227,11 +261,12 @@ case "$1" in
   up)      cmd_up "$2" ;;
   run)     [ -n "$2" ] || die "usage: ./demo.sh run <scenario> [--stress]"; cmd_run "$2" "$3" ;;
   matrix)  cmd_matrix ;;
+  replay)  cmd_replay ;;
   load)    export SCENARIO="${2:-otel}"; start_load ;;
   chaos)   cmd_chaos "$2" "$3" ;;
   verify)  parse_scenario "${2:-otel-e2e}" ""; shift 2; python3 scripts/verify.py --variant "$NAME" --scenario "$ARCH" "$@" ;;
   monitor) python3 scripts/monitor.py "${2:-otel}" ;;
   down)    cmd_down ;;
   report)  python3 scripts/report.py ;;
-  *)       sed -n 2,17p "$0" ;;
+  *)       sed -n 2,24p "$0" ;;
 esac

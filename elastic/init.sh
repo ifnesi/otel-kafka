@@ -12,7 +12,7 @@ curl -sf -X PUT "$ES/_ingest/pipeline/add-ingested-at" -H "$H" -d '{
 echo
 
 curl -sf -X PUT "$ES/_index_template/demo-logs" -H "$H" -d '{
-  "index_patterns": ["otel-logs", "kafka-logs"],
+  "index_patterns": ["otel-logs", "kafka-logs", "kafka-logs-replay"],
   "priority": 500,
   "template": {
     "settings": { "number_of_shards": 1, "number_of_replicas": 0, "refresh_interval": "1s",
